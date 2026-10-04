@@ -3,9 +3,6 @@
 Partitioned by the data timestamp (UTC): year=YYYY/month=MM/day=DD.
 Rows are upserted (Delta MERGE) on the natural key, so overlapping API windows and
 re-runs never create duplicates; the most recently ingested value wins.
-
-Rows from generated (surrogate) history are marked with is_surrogate = true; they come from
-Bronze records whose source_url starts with "surrogate://".
 """
 
 import logging
@@ -14,7 +11,7 @@ from datetime import datetime
 import polars as pl
 from deltalake import DeltaTable
 
-from emaps_etl import storage
+from emaps_etl import bronze, watermark, writer
 from emaps_etl.config import Settings
 
 log = logging.getLogger(__name__)
@@ -32,7 +29,6 @@ MIX_SCHEMA = pl.Schema(
         "power_mw": pl.Float64,
         "estimation_method": pl.String,
         "is_estimated": pl.Boolean,
-        "is_surrogate": pl.Boolean,
         "updated_at": UTC_DATETIME,
         "ingested_at": UTC_DATETIME,
     }
@@ -51,7 +47,6 @@ FLOWS_SCHEMA = pl.Schema(
         "counterpart_zone": pl.String,
         "import_mw": pl.Float64,
         "export_mw": pl.Float64,
-        "is_surrogate": pl.Boolean,
         "updated_at": UTC_DATETIME,
         "ingested_at": UTC_DATETIME,
     }
@@ -66,10 +61,6 @@ FLOWS_CONSTRAINTS = {
 
 def _ts(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
-
-
-def is_surrogate(record: dict) -> bool:
-    return record["source_url"].startswith("surrogate://")
 
 
 def flatten_mix(record: dict) -> pl.DataFrame:
@@ -87,7 +78,6 @@ def flatten_mix(record: dict) -> pl.DataFrame:
             "datetime_utc": _ts(entry["datetime"]),
             "estimation_method": estimation_method,
             "is_estimated": estimation_method not in (None, "MEASURED"),
-            "is_surrogate": is_surrogate(record),
             "updated_at": _ts(entry.get("updatedAt")),
             "ingested_at": _ts(record["ingested_at"]),
         }
@@ -118,7 +108,6 @@ def flatten_flows(record: dict) -> pl.DataFrame:
                     "counterpart_zone": counterpart,
                     "import_mw": imports.get(counterpart, 0.0),
                     "export_mw": exports.get(counterpart, 0.0),
-                    "is_surrogate": is_surrogate(record),
                     "updated_at": _ts(entry.get("updatedAt")),
                     "ingested_at": _ts(record["ingested_at"]),
                 }
@@ -143,10 +132,10 @@ def upsert(
     df: pl.DataFrame, table: str, key: list[str], constraints: dict[str, str], settings: Settings
 ) -> None:
     """Create the Delta table on first write, otherwise MERGE on the key."""
-    uri = storage.path(settings, "silver", table)
-    options = storage.delta_options(settings)
+    uri = writer.path(settings, "silver", table)
+    options = writer.delta_options(settings)
 
-    if not storage.table_exists(uri, settings):
+    if not writer.table_exists(uri, settings):
         df.write_delta(
             uri,
             mode="error",
@@ -183,3 +172,23 @@ def update_flows(records: list[dict], settings: Settings) -> None:
     df = pl.concat([flatten_flows(record) for record in records])
     df = add_partition_columns(deduplicate(df, FLOWS_KEY))
     upsert(df, FLOWS_TABLE, FLOWS_KEY, FLOWS_CONSTRAINTS, settings)
+
+
+def load_new_bronze(table: str, settings: Settings) -> int:
+    """Load the Bronze files ingested since the table's watermark. Returns the number of files.
+
+    The watermark is moved only after a successful MERGE. If that update fails, the next run
+    loads the same files again, which is harmless because the MERGE is idempotent.
+    """
+    after = watermark.read(table, settings)
+    records = bronze.records_since(table, after, settings)
+    if not records:
+        log.info("silver/%s: no new Bronze files since %s", table, after)
+        return 0
+
+    update = update_mix if table == MIX_TABLE else update_flows
+    update(records, settings)
+    latest = max(datetime.fromisoformat(record["ingested_at"]) for record in records)
+    watermark.write(table, latest, settings)
+    log.info("silver/%s: loaded %d Bronze files, watermark now %s", table, len(records), latest)
+    return len(records)

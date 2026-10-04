@@ -1,6 +1,6 @@
 """Plot the Gold time series as PNG charts for the README.
 
-    poetry run python scripts/plot_gold.py [storage_dir]   # default: sample_data -> docs/*.png
+    poetry run python scripts/plot_gold.py [location]   # default: the S3 data lake -> docs/*.png
 
 Daily values are aggregated to full calendar months; 5 years of daily data is too noisy to read.
 """
@@ -14,6 +14,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import polars as pl  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
+
+from emaps_etl import reader  # noqa: E402
+from emaps_etl.config import get_settings  # noqa: E402
 
 OUTPUT = Path("docs")
 NOTE = "Surrogate data (demo) until 3 Oct 2026, real Electricity Maps data after. Full months only."
@@ -60,8 +63,12 @@ def style(ax: plt.Axes) -> None:
     ax.tick_params(colors=MUTED, labelsize=9, length=0)
 
 
-def plot_mix_share(root: Path) -> Path:
-    daily = full_months(pl.read_delta(str(root / "gold" / "daily_relative_mix")))
+def read_gold(root: str, table: str) -> pl.DataFrame:
+    return reader.read_table(reader.table_path(root, "gold", table))
+
+
+def plot_mix_share(root: str) -> Path:
+    daily = full_months(read_gold(root, "daily_relative_mix"))
     group_of = {s: group for group, (sources, _) in SOURCE_GROUPS.items() for s in sources}
     monthly = (
         daily.with_columns(group=pl.col("source").replace_strict(group_of))
@@ -124,12 +131,11 @@ def plot_mix_share(root: Path) -> Path:
     return save(fig, "energy_mix_share.png")
 
 
-def plot_net_exports(root: Path) -> Path:
-    gold = root / "gold"
-    exports = pl.read_delta(str(gold / "fr_daily_exports")).select(
+def plot_net_exports(root: str) -> Path:
+    exports = read_gold(root, "fr_daily_exports").select(
         "date_utc", neighbour=pl.col("to_zone"), name=pl.col("to_zone_name"), net=pl.col("net_mwh")
     )
-    imports = pl.read_delta(str(gold / "fr_daily_imports")).select(
+    imports = read_gold(root, "fr_daily_imports").select(
         "date_utc",
         neighbour=pl.col("from_zone"),
         name=pl.col("from_zone_name"),
@@ -200,7 +206,7 @@ def save(fig: plt.Figure, name: str) -> Path:
 
 
 def main() -> None:
-    root = Path(sys.argv[1] if len(sys.argv) > 1 else "sample_data")
+    root = sys.argv[1] if len(sys.argv) > 1 else get_settings().storage_uri
     for path in (plot_mix_share(root), plot_net_exports(root)):
         print(f"Wrote {path}")
 

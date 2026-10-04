@@ -12,11 +12,11 @@ def main() -> None:
     )
     settings = get_settings()
 
-    mix = bronze.ingest("electricity_mix", settings)
-    flows = bronze.ingest("electricity_flows", settings)
+    bronze.ingest("electricity_mix", settings)
+    bronze.ingest("electricity_flows", settings)
 
-    silver.update_mix([mix], settings)
-    silver.update_flows([flows], settings)
+    silver.load_new_bronze(silver.MIX_TABLE, settings)
+    silver.load_new_bronze(silver.FLOWS_TABLE, settings)
 
     gold.build_daily_relative_mix(settings)
     gold.build_daily_imports(settings)

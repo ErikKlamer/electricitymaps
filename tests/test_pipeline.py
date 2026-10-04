@@ -7,7 +7,7 @@ import pytest
 import requests
 from tenacity import wait_none
 
-from emaps_etl import api, checks, gold, silver, storage
+from emaps_etl import api, bronze, checks, gold, reader, silver, watermark, writer
 from emaps_etl.config import Settings
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -18,8 +18,25 @@ def load_record(stream: str) -> dict:
 
 
 @pytest.fixture
-def settings(tmp_path) -> Settings:
-    return Settings(storage_uri=str(tmp_path), api_key="test-key")
+def settings(tmp_path, monkeypatch) -> Settings:
+    """Settings whose writes go to a temporary local folder instead of S3."""
+    monkeypatch.setattr(writer, "path", lambda _, *parts: "/".join([str(tmp_path), *parts]))
+    monkeypatch.setattr(writer, "delta_options", lambda _: {})
+
+    def write_json(uri: str, data: dict, _) -> None:
+        Path(uri).parent.mkdir(parents=True, exist_ok=True)
+        Path(uri).write_text(json.dumps(data))
+
+    monkeypatch.setattr(writer, "write_json", write_json)
+    return Settings(storage_uri="s3://test-bucket", api_key="test-key")
+
+
+# --- Settings ---
+
+
+def test_storage_must_be_s3():
+    with pytest.raises(ValueError, match="must be an S3 location"):
+        Settings(storage_uri="data", api_key="test-key")
 
 
 # --- Silver ---
@@ -60,8 +77,8 @@ def test_silver_upsert_is_idempotent_and_updates_values(settings):
     silver.update_mix([record], settings)
     silver.update_mix([record], settings)
 
-    uri = storage.path(settings, "silver", silver.MIX_TABLE)
-    first = storage.read_table(uri, settings)
+    uri = writer.path(settings, "silver", silver.MIX_TABLE)
+    first = reader.read_table(uri, settings.aws_region)
     assert len(first) == len(silver.flatten_mix(record))
 
     # A newer ingestion of the same hour overwrites the value instead of adding a row.
@@ -70,7 +87,7 @@ def test_silver_upsert_is_idempotent_and_updates_values(settings):
     newer["response"]["history"][0]["mix"]["nuclear"] = 12345.0
     silver.update_mix([newer], settings)
 
-    updated = storage.read_table(uri, settings)
+    updated = reader.read_table(uri, settings.aws_region)
     assert len(updated) == len(first)
     hour = datetime.fromisoformat(record["response"]["history"][0]["datetime"])
     nuclear = updated.filter(pl.col("datetime_utc") == hour, pl.col("source") == "nuclear")
@@ -87,6 +104,37 @@ def test_silver_rejects_negative_power(settings):
         silver.update_mix([bad], settings)
 
 
+def write_bronze(record: dict, stream: str, settings: Settings) -> None:
+    ingested_at = datetime.fromisoformat(record["ingested_at"])
+    folder = f"year={ingested_at:%Y}/month={ingested_at:%m}/day={ingested_at:%d}"
+    name = f"{ingested_at.strftime(bronze.FILE_TIMESTAMP)}.json"
+    writer.write_json(writer.path(settings, "bronze", stream, folder, name), record, settings)
+
+
+def test_incremental_load_only_loads_new_bronze_files(settings):
+    record = load_record("electricity_mix")
+    write_bronze(record, "electricity_mix", settings)
+
+    assert silver.load_new_bronze(silver.MIX_TABLE, settings) == 1
+    assert silver.load_new_bronze(silver.MIX_TABLE, settings) == 0  # nothing new
+
+    newer = json.loads(json.dumps(record))
+    newer["ingested_at"] = "2026-10-03T21:30:00+00:00"
+    newer["response"]["history"][0]["mix"]["nuclear"] = 12345.0
+    write_bronze(newer, "electricity_mix", settings)
+
+    assert silver.load_new_bronze(silver.MIX_TABLE, settings) == 1  # only the new file
+    assert watermark.read(silver.MIX_TABLE, settings) == datetime(2026, 10, 3, 21, 30, tzinfo=UTC)
+    df = reader.read_table(writer.path(settings, "silver", silver.MIX_TABLE), settings.aws_region)
+    assert 12345.0 in df["power_mw"].to_list()
+
+
+def test_watermark_is_derived_from_silver_when_missing(settings):
+    silver.update_mix([load_record("electricity_mix")], settings)  # no watermark file written
+
+    assert watermark.read(silver.MIX_TABLE, settings) == datetime(2026, 10, 3, 9, 30, tzinfo=UTC)
+
+
 # --- Gold ---
 
 
@@ -101,7 +149,6 @@ def test_daily_relative_mix_percentages():
             "datetime_utc": [hourly(0), hourly(0), hourly(0), hourly(1), hourly(1), hourly(1)],
             "source": ["nuclear", "wind", "battery_storage_charge"] * 2,
             "power_mw": [300.0, 100.0, 50.0, 300.0, None, 50.0],
-            "is_surrogate": [True] * 3 + [False] * 3,
         }
     )
     zones = pl.DataFrame({"zone": ["FR"], "zone_name": ["France"], "country_code": ["FR"]})
@@ -112,7 +159,6 @@ def test_daily_relative_mix_percentages():
     assert df["energy_mwh"].to_list() == [600.0, 100.0]
     assert df["percentage"].round(2).to_list() == [85.71, 14.29]
     assert df["hours_covered"].to_list() == [2, 2]
-    assert df["surrogate_hours"].to_list() == [1, 1]
     assert df["date_utc"].to_list() == [date(2026, 10, 2)] * 2
     assert df["zone_name"].to_list() == ["France"] * 2
     assert checks.percentages_sum_to_100(df)[0]
@@ -126,7 +172,6 @@ def test_daily_imports_and_exports_are_netted():
             "counterpart_zone": ["ES", "ES", "DE", "DE"],
             "import_mw": [100.0, 100.0, 10.0, 0.0],
             "export_mw": [30.0, 0.0, 50.0, 60.0],
-            "is_surrogate": [False] * 4,
         }
     )
     zones = pl.DataFrame(
@@ -152,10 +197,12 @@ def test_full_pipeline_from_fixtures(settings):
     gold.build_daily_imports(settings)
     gold.build_daily_exports(settings)
 
-    daily_mix = storage.read_table(storage.path(settings, "gold", gold.DAILY_MIX_TABLE), settings)
+    daily_mix = reader.read_table(
+        writer.path(settings, "gold", gold.DAILY_MIX_TABLE), settings.aws_region
+    )
     assert checks.percentages_sum_to_100(daily_mix)[0]
     for table in (gold.IMPORTS_TABLE, gold.EXPORTS_TABLE):
-        df = storage.read_table(storage.path(settings, "gold", table), settings)
+        df = reader.read_table(writer.path(settings, "gold", table), settings.aws_region)
         assert (df["net_mwh"] > 0).all()
 
 

@@ -5,13 +5,16 @@ One JSON file per API call, partitioned by ingestion date:
 """
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from emaps_etl import storage
+from emaps_etl import reader, writer
 from emaps_etl.api import get_json
 from emaps_etl.config import Settings, get_api_key
 
 log = logging.getLogger(__name__)
+
+# Bronze file names start with the ingestion timestamp in this format (22 characters).
+FILE_TIMESTAMP = "%Y%m%dT%H%M%S%fZ"
 
 # Bronze stream name -> API endpoint. The trial API key only allows the `history` endpoints
 # (last 24 hours, hourly); see "Limitations" in the README.
@@ -39,15 +42,40 @@ def ingest(stream: str, settings: Settings) -> dict:
         "response": response,
     }
 
-    file_path = storage.path(
+    file_path = writer.path(
         settings,
         "bronze",
         stream,
         f"year={ingested_at:%Y}",
         f"month={ingested_at:%m}",
         f"day={ingested_at:%d}",
-        f"{ingested_at:%Y%m%dT%H%M%S%fZ}.json",
+        f"{ingested_at.strftime(FILE_TIMESTAMP)}.json",
     )
-    storage.write_json(file_path, record, settings)
+    writer.write_json(file_path, record, settings)
     log.info("Stored %s (%d hours) in %s", stream, len(response.get("history", [])), file_path)
     return record
+
+
+def records_since(stream: str, after: datetime | None, settings: Settings) -> list[dict]:
+    """Bronze records of a stream ingested after `after`; all records when `after` is None.
+
+    Bronze is partitioned by ingestion date, so only the day folders from `after` until today
+    are listed, and file names start with the ingestion timestamp, so only new files are read.
+    """
+    root = writer.path(settings, "bronze", stream)
+    if after is None:
+        folders = [root]
+    else:
+        days = (datetime.now(UTC).date() - after.date()).days
+        dates = [after.date() + timedelta(days=n) for n in range(days + 1)]
+        folders = [f"{root}/year={d:%Y}/month={d:%m}/day={d:%d}" for d in dates]
+
+    uris = [uri for folder in folders for uri in reader.list_files(folder, settings.aws_region)]
+    if after is not None:
+        uris = [uri for uri in uris if ingested_at_of(uri) > after]
+    return [reader.read_json(uri, settings.aws_region) for uri in uris]
+
+
+def ingested_at_of(uri: str) -> datetime:
+    name = uri.rsplit("/", 1)[-1]
+    return datetime.strptime(name[:22], FILE_TIMESTAMP).replace(tzinfo=UTC)

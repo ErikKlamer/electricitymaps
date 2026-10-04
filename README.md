@@ -1,6 +1,6 @@
 # Electricity Maps ETL pipeline
 
-ETL pipeline for France's (FR) hourly **electricity mix** and **electricity flows** from the [Electricity Maps API](https://www.electricitymaps.com/), built with Polars, Delta Lake (delta-rs) and Dagster, following the Bronze → Silver → Gold medallion architecture. Data is stored locally or in AWS S3.
+ETL pipeline for France's (FR) hourly **electricity mix** and **electricity flows** from the [Electricity Maps API](https://www.electricitymaps.com/), built with Polars, Delta Lake (delta-rs) and Dagster, following the Bronze → Silver → Gold medallion architecture. The data lake is an AWS S3 bucket: the pipeline writes to it as an IAM writer role, and anyone can read it.
 
 ```
 Electricity Maps API (/v4/electricity-mix/history, /v4/electricity-flows/history)
@@ -22,7 +22,9 @@ Gold     daily data products (Delta tables)              partitioned by year
 |---|---|
 | [src/emaps_etl/config.py](src/emaps_etl/config.py) | Settings (`EMAPS_*` environment variables, `.env`) and API key lookup |
 | [src/emaps_etl/api.py](src/emaps_etl/api.py) | API client with retries |
-| [src/emaps_etl/storage.py](src/emaps_etl/storage.py) | Local / S3 file and Delta table helpers |
+| [src/emaps_etl/writer.py](src/emaps_etl/writer.py) | Writes to the S3 data lake (raw JSON, Delta tables) |
+| [src/emaps_etl/reader.py](src/emaps_etl/reader.py) | Reads Delta tables and JSON files from S3 (without credentials) or a local copy |
+| [src/emaps_etl/watermark.py](src/emaps_etl/watermark.py) | High-water marks for the incremental Silver load |
 | [src/emaps_etl/bronze.py](src/emaps_etl/bronze.py), [silver.py](src/emaps_etl/silver.py), [gold.py](src/emaps_etl/gold.py) | The three layers |
 | [src/emaps_etl/checks.py](src/emaps_etl/checks.py) | Data quality checks |
 | [src/emaps_etl/definitions.py](src/emaps_etl/definitions.py) | Dagster assets, checks and schedule |
@@ -30,22 +32,318 @@ Gold     daily data products (Delta tables)              partitioned by year
 | [tests/](tests/) | Unit tests, with real API responses as fixtures |
 | [zones.json](zones.json) | Zone metadata (name, country), a snapshot of the API's `/v4/zones` |
 | [scripts/plot_gold.py](scripts/plot_gold.py), [docs/](docs/) | Charts of the Gold tables (see [Charts](#charts)) |
+| [scripts/browse.py](scripts/browse.py) | Browse the Silver and Gold tables interactively (see [1. Data consumer](#1-data-consumer)) |
 | [scripts/generate_surrogate_history.py](scripts/generate_surrogate_history.py) | Generates 5 years of surrogate history (see [Surrogate history](#surrogate-history)) |
-| `sample_data/` | Sample output: real data plus surrogate history (not committed, ~80 MB; see [Sample outputs](#sample-outputs)) |
-| [infra/](infra/) | Terraform for the AWS resources |
+| [sample_output/](sample_output/) | Sample output: partitioned Bronze files and Silver/Gold Delta tables (see [Sample output](#sample-output)) |
+| `sample_data/` | Optional local copy of the full data lake (not committed; see [1. Data consumer](#1-data-consumer)) |
+| [infra/](infra/) | Terraform for the AWS resources (see [3. Deployer](#3-deployer)) |
+| [docs/build_pseudocode.md](docs/build_pseudocode.md) | Build order in pseudocode |
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | CI: lint and tests |
 
-## New deployment
+## Getting started
 
-Steps to set up a fresh development environment from scratch.
+Pick the role that matches your goal:
+
+| Role | Goal | Needs AWS access? |
+|---|---|---|
+| [1. Data consumer](#1-data-consumer) | Browse and analyse the data | No: the data lake is publicly readable |
+| [2. Data engineer](#2-data-engineer) | Run and maintain the existing pipeline | Yes: permission to assume the writer role |
+| [3. Deployer](#3-deployer) | Deploy everything from scratch in your own AWS account | Yes: admin rights |
+
+The tools are installed the same way for all roles: see [Install tools](#install-tools).
+
+**Running the pipeline end to end** (API → Bronze → Silver → Gold) writes to an S3 data lake as the writer role, so it needs an AWS account with the infrastructure deployed and an Electricity Maps API key: follow [3. Deployer](#3-deployer) in your own AWS account, or [2. Data engineer](#2-data-engineer) with access to an existing deployment. Without AWS access, the output can still be inspected: in the repository ([sample_output/](sample_output/)) and in the public data lake.
+
+## 1. Data consumer
+
+**Goal:** browse and analyse the Silver and Gold tables.
 
 ### Prerequisites
 
-- Linux or macOS with `git` and `curl`
-- Python 3.12 (`python3.12 --version`)
-- Terraform >= 1.6 (`terraform version`), used to provision the AWS infrastructure
+- `git`, Python 3.12 and Poetry >= 2.0 ([Install tools](#install-tools)).
+- Optional: the AWS CLI v2, only for a local copy (step 4).
+- No AWS account, API key or configuration: the data lake is publicly readable.
 
-#### Install Terraform
+### Steps
+
+1. **Install the project:**
+
+   ```bash
+   git clone <repo-url> electricitymaps && cd electricitymaps
+   poetry install
+   ```
+
+2. **Browse the tables** with [scripts/browse.py](scripts/browse.py). It asks for a layer (Silver or Gold) and a table, and shows its columns, row count, time range and latest rows:
+
+   ```bash
+   poetry run python scripts/browse.py s3://emaps-etl-<account_id>-eu-central-1   # the full data lake
+   poetry run python scripts/browse.py sample_output                              # the sample in the repository
+   ```
+
+3. **Understand the data:** see [Data layers and schemas](#data-layers-and-schemas) for every table and column, and the [charts](#charts) for an overview. Keep in mind:
+   - **All times are UTC**, and a Gold "day" is a UTC day. For French local time, convert first (see [All timestamps and days in UTC](#all-timestamps-and-days-in-utc)).
+   - **Data before 3 October 2026 15:00 UTC is [surrogate history](#surrogate-history)** (generated, for demonstration only), recognisable by `estimation_method = "SURROGATE"` in `silver/electricity_mix`.
+   - **The first and the current day are usually incomplete**: check `hours_covered` in Gold.
+
+4. **Optional: work offline** with a local copy (no credentials needed):
+
+   ```bash
+   aws s3 sync s3://emaps-etl-<account_id>-eu-central-1/ sample_data/ --no-sign-request
+   poetry run python scripts/browse.py sample_data
+   ```
+
+5. **Optional: use the tables in your own code**, e.g. with Polars:
+
+   ```python
+   import polars as pl
+
+   pl.read_delta(
+       "s3://emaps-etl-<account_id>-eu-central-1/gold/daily_relative_mix",
+       storage_options={"aws_region": "eu-central-1", "aws_skip_signature": "true"},
+   )
+   ```
+
+## 2. Data engineer
+
+**Goal:** run the existing pipeline, keep it running on schedule and maintain it. The infrastructure and the API key in SSM already exist (see [3. Deployer](#3-deployer)).
+
+### Prerequisites
+
+- `git`, Python 3.12, Poetry >= 2.0 and the AWS CLI v2 ([Install tools](#install-tools)).
+- An AWS CLI profile for an IAM user that is listed in the deployment's `writer_principal_arns`, so it may assume the writer role `emaps-etl-writer`. Ask the deployer to add your user.
+
+### Steps
+
+1. **Install the project:**
+
+   ```bash
+   git clone <repo-url> electricitymaps && cd electricitymaps
+   poetry install
+   ```
+
+2. **Add the writer profile** to `~/.aws/config`; `source_profile` is your own profile:
+
+   ```ini
+   [profile emaps-writer]
+   role_arn = arn:aws:iam::<account_id>:role/emaps-etl-writer
+   source_profile = <your-profile>
+   region = eu-central-1
+   ```
+
+   Profile sections other than `[default]` must be written as `[profile <name>]`; delta-rs ignores sections without the `profile` prefix. Check that the role works:
+
+   ```bash
+   aws sts get-caller-identity --profile emaps-writer   # ...:assumed-role/emaps-etl-writer/...
+   ```
+
+3. **Configure** the pipeline in `.env` (gitignored; template: [.env.example](.env.example)):
+
+   ```bash
+   cp .env.example .env    # set EMAPS_STORAGE_URI and EMAPS_AWS_PROFILE
+   ```
+
+   | Variable | Default | Meaning |
+   |---|---|---|
+   | `EMAPS_STORAGE_URI` | (required) | S3 location of the data lake, e.g. `s3://emaps-etl-<account_id>-eu-central-1`. Must start with `s3://` |
+   | `EMAPS_AWS_PROFILE` | (empty) | AWS profile for S3 and SSM, e.g. `emaps-writer`. When empty, the standard AWS credential chain is used |
+   | `EMAPS_API_KEY` | (empty) | Leave empty: the key is read from SSM (`/emaps-etl/electricitymaps/api-key`). Set it only as a local override |
+   | `EMAPS_ZONE` | `FR` | Electricity Maps zone |
+
+   The pipeline writes only to the S3 data lake ([writer.py](src/emaps_etl/writer.py)), as the writer role. Reading needs no credentials ([reader.py](src/emaps_etl/reader.py)).
+
+4. **Run the pipeline once** to check the setup (about a minute: the Silver and Gold tables span many small daily partitions on S3):
+
+   ```bash
+   poetry run dagster job execute -m emaps_etl.definitions -j etl   # with data quality checks
+   poetry run python -m emaps_etl                                   # or without Dagster
+   ```
+
+5. **Keep it running with Dagster** and its schedule; see [Dagster operations](#dagster-operations) below.
+
+6. **Check the result** with `poetry run python scripts/browse.py` (uses `EMAPS_STORAGE_URI`), and the check results in the Dagster UI.
+
+7. **When changing the code:** run the tests and the linter (the same checks run in GitHub Actions on every push and pull request, [ci.yml](.github/workflows/ci.yml)), regenerate the [charts](#charts) when needed, and keep this README and [docs/build_pseudocode.md](docs/build_pseudocode.md) up to date.
+
+   ```bash
+   poetry run pytest
+   poetry run ruff check . && poetry run ruff format --check .
+   ```
+
+### Dagster operations
+
+Dagster runs locally (`dagster dev`): a webserver (the UI), a daemon that starts scheduled runs, and a code server that loads [definitions.py](src/emaps_etl/definitions.py). Settings come from `.env`, which `dagster dev` loads at start-up. All Dagster state (run history, schedule on/off, logs) lives in `DAGSTER_HOME` (`.dagster/`, gitignored).
+
+All commands below run from the repository root with:
+
+```bash
+export DAGSTER_HOME=$PWD/.dagster
+```
+
+#### Start
+
+In the foreground (stops when the terminal closes):
+
+```bash
+mkdir -p $DAGSTER_HOME
+poetry run dagster dev -m emaps_etl.definitions
+```
+
+In the background, detached from the terminal, with logs in `.dagster/dagster.log`:
+
+```bash
+mkdir -p $DAGSTER_HOME
+setsid nohup .venv/bin/dagster dev -m emaps_etl.definitions > $DAGSTER_HOME/dagster.log 2>&1 < /dev/null &
+```
+
+The UI is at http://localhost:3000 once the log shows `Serving dagster-webserver`.
+
+#### Schedule
+
+`etl_schedule` runs the whole job (Bronze → Silver → Gold and all checks) every 12 hours, at 00:00 and 12:00 UTC. Turn it on once; the setting is stored in `DAGSTER_HOME` and survives restarts.
+
+```bash
+poetry run dagster schedule start etl_schedule -m emaps_etl.definitions   # turn on
+poetry run dagster schedule stop etl_schedule -m emaps_etl.definitions    # turn off
+poetry run dagster schedule list -m emaps_etl.definitions                 # status: RUNNING / STOPPED
+```
+
+Or in the UI: *Automation → etl_schedule*.
+
+**Scheduled runs only happen while `dagster dev` is running.** When the laptop is off, asleep or Dagster is stopped, runs are skipped and not caught up later. Because the API only returns the last 24 hours, a break of more than about 24 hours leaves a permanent gap in the data (reported by the `silver_mix_no_missing_hours` check). After a break, start a manual run as soon as possible.
+
+#### Run manually
+
+- **UI:** *Jobs → etl → Materialize all*, or select individual assets under *Assets* and choose *Materialize selected*.
+- **Command line** (does not need `dagster dev`):
+
+  ```bash
+  poetry run dagster job execute -m emaps_etl.definitions -j etl
+  ```
+
+#### Monitor
+
+| What | Where |
+|---|---|
+| Run history, status and logs per step | UI: *Runs* |
+| Data quality check results | UI: *Assets* → asset → *Checks* |
+| Bronze files loaded into Silver per run | UI: *Assets* → Silver asset → metadata `bronze_files_loaded` |
+| Next scheduled run | UI: *Automation → etl_schedule* |
+| Is Dagster running? | `pgrep -af "dagster dev"`, or `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000` (200 = up) |
+| Process log (background start) | `tail -f .dagster/dagster.log` |
+
+A failed blocking check (unique keys in Silver) stops the Gold assets for that run; the run shows as failed in *Runs*. A warning check (missing hours) does not stop the run.
+
+#### Stop
+
+```bash
+pkill -f "dagster dev -m emaps_etl.definitions"
+```
+
+or `Ctrl+C` in the terminal when started in the foreground. The schedule stays turned on and resumes when Dagster starts again.
+
+#### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Runs fail at Bronze with `401 Unauthorized` | Invalid API key, or the endpoint is not included in the API plan. Check the SSM parameter (or `EMAPS_API_KEY` in `.env` when set). |
+| Runs fail with an AWS `AccessDenied` or credentials error | The `emaps-writer` profile cannot assume the writer role. Check with `aws sts get-caller-identity --profile emaps-writer`. |
+| `EMAPS_STORAGE_URI` missing or "must be an S3 location" | `.env` is missing, or the command does not run from the repository root. |
+| Changes to `.env` or the code have no effect | `.env` is read when `dagster dev` starts: restart it. Code changes are picked up via *Deployment* → code location `emaps_etl.definitions` → *Reload* in the UI, or by restarting. |
+| `silver_mix_no_missing_hours` warns | Dagster did not run for more than 24 hours; the missing hours cannot be retrieved anymore with the trial API key. |
+| Port 3000 already in use | Another `dagster dev` is running: stop it first, or start with `-p 3001`. |
+| `The Poetry configuration is invalid` | An old Poetry (e.g. the Ubuntu package `python3-poetry`, 1.8) is used instead of Poetry >= 2.0: see [Install tools](#install-tools). |
+
+## 3. Deployer
+
+**Goal:** deploy the complete setup from scratch in your own AWS account: infrastructure, API key, data lake with sample data, and the scheduled pipeline.
+
+### Prerequisites
+
+- `git`, Python 3.12, Poetry >= 2.0, Terraform >= 1.6 and the AWS CLI v2 ([Install tools](#install-tools)).
+- An AWS CLI profile with admin rights in the target account.
+- An Electricity Maps API key ([sandbox key](https://help.electricitymaps.com/en/articles/13169368-using-a-sandbox-api-key)).
+
+### Steps
+
+1. **Install the project:**
+
+   ```bash
+   git clone <repo-url> electricitymaps && cd electricitymaps
+   poetry install
+   ```
+
+2. **Store the API key in SSM Parameter Store.** This is a one-time manual step: the parameter is deliberately not managed by Terraform, because the `aws_ssm_parameter` resource stores the decrypted value in the Terraform state (see [API key in SSM Parameter Store](#api-key-in-ssm-parameter-store-outside-terraform)).
+
+   ```bash
+   aws ssm put-parameter --profile <admin-profile> --region eu-central-1 \
+     --name /emaps-etl/electricitymaps/api-key \
+     --type SecureString --overwrite --value "<api-key>"
+   ```
+
+3. **Create the infrastructure** with Terraform in [infra/](infra/):
+
+   | Resource | Name | Notes |
+   |---|---|---|
+   | S3 bucket | `emaps-etl-<account_id>-<region>` | Data lake (`bronze/`, `silver/`, `gold/`, `_state/`); **publicly readable**, versioned, SSE-S3 encrypted, ACLs disabled, TLS-only, noncurrent versions expire after 30 days |
+   | IAM role | `emaps-etl-writer` | Read/write on the whole bucket, read the API key parameter. Can only be assumed by the IAM principals in `writer_principal_arns` (default: the identity that runs Terraform) |
+
+   ```bash
+   cd infra
+   cp terraform.tfvars.example terraform.tfvars   # set aws_profile (and optionally writer_principal_arns)
+   terraform init
+   terraform plan -out tfplan
+   terraform apply tfplan
+   cd ..
+   ```
+
+   The Terraform state is stored locally in `infra/terraform.tfstate` and is **not** in git. Keep it safe: without it, Terraform does not know that the bucket and role exist, and `terraform apply` from another machine fails with "already exists". To manage the infrastructure from another machine, copy this file, or set up a remote backend (the `backend "s3"` block in [infra/versions.tf](infra/versions.tf) is prepared for this).
+
+4. **Set up the writer profile and `.env`** as in steps 2 and 3 of [2. Data engineer](#2-data-engineer). `terraform output aws_config_profile` prints the profile, and `terraform output storage_uri` the value for `EMAPS_STORAGE_URI`.
+
+5. **Load the first real data** (the last 24 hours):
+
+   ```bash
+   poetry run python -m emaps_etl
+   ```
+
+6. **Optional: add 5 years of [surrogate history](#surrogate-history)**, so the data products show multi-year trends. It writes surrogate Bronze files, then rebuilds Silver and Gold from all Bronze data; it takes about 10 minutes.
+
+   ```bash
+   poetry run python scripts/generate_surrogate_history.py
+   ```
+
+7. **Start Dagster and turn on the schedule** (see [Dagster operations](#dagster-operations)). From now on the pipeline runs every 12 hours while Dagster is running.
+
+8. **Verify the deployment:**
+
+   ```bash
+   aws s3 ls s3://<bucket>/ --no-sign-request                       # public read works
+   poetry run python scripts/browse.py s3://<bucket>                 # tables are readable
+   poetry run dagster job execute -m emaps_etl.definitions -j etl    # all checks pass
+   ```
+
+9. **Hand over:** add the IAM users of the data engineers to `writer_principal_arns` and apply again; share the bucket name with data consumers.
+
+## Install tools
+
+### Poetry
+
+Poetry >= 2.0 manages the dependencies and the virtual environment. Install it with the official installer (Linux and macOS):
+
+```bash
+curl -sSL https://install.python-poetry.org | python3 -
+```
+
+This installs Poetry into `~/.local/bin`. If `poetry` is not found afterwards, add that directory to your `PATH` (e.g. in `~/.bashrc` or `~/.zshrc`):
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+poetry --version
+```
+
+Do not use the Ubuntu/Debian package `python3-poetry`: it is version 1.8, which cannot read this project's `pyproject.toml`. Make sure `~/.local/bin` comes first in your `PATH`.
+
+### Terraform (deployer only)
 
 Ubuntu / Debian / Linux Mint (HashiCorp apt repository):
 
@@ -66,193 +364,22 @@ brew tap hashicorp/tap
 brew install hashicorp/tap/terraform
 ```
 
-Verify:
+Verify with `terraform version`.
 
-```bash
-terraform version
-```
+### The project environment
 
-### 1. Clone the repository
-
-```bash
-git clone <repo-url> electricitymaps
-cd electricitymaps
-```
-
-### 2. Install Poetry
-
-Poetry manages the dependencies and the virtual environment. Install it with the official installer:
-
-```bash
-curl -sSL https://install.python-poetry.org | python3 -
-```
-
-This installs Poetry into `~/.local/bin`. If `poetry` is not found afterwards, add that directory to your `PATH` (e.g. in `~/.bashrc`):
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-poetry --version
-```
-
-### 3. Create the virtual environment and install dependencies
-
-The repository's `poetry.toml` sets `virtualenvs.in-project = true`, so the virtual environment is created in `.venv/` inside the repository.
-
-```bash
-poetry env use python3.12
-poetry install                          # core (incl. Dagster) + dev dependencies
-```
-
-Check the environment:
-
-```bash
-poetry env info
-```
-
-### 4. Use the environment
-
-Either activate the virtual environment:
-
-```bash
-source .venv/bin/activate
-```
-
-or prefix commands with `poetry run`, e.g. `poetry run pytest`.
-
-In VS Code, select `.venv/bin/python` as the interpreter.
-
-### Dependencies
+`poetry install` creates the virtual environment in `.venv/` inside the repository (`poetry.toml` sets `virtualenvs.in-project = true`) and installs all dependencies:
 
 | Group | Packages | Purpose |
 |---|---|---|
-| core | `polars`, `deltalake` | Transformations and Delta Lake tables (local and S3) |
+| core | `polars`, `deltalake` | Transformations and Delta Lake tables on S3 |
 | core | `requests`, `tenacity` | API client with retries and backoff |
 | core | `pydantic-settings` | Typed configuration from environment variables and `.env` |
 | core | `boto3` | AWS access (SSM Parameter Store, S3) |
 | core | `dagster`, `dagster-webserver` | Orchestration on the local machine (`dagster dev`) |
 | dev | `pytest`, `ruff`, `matplotlib` | Tests, linting and formatting, charts |
 
-Add dependencies with `poetry add <package>` (or `poetry add --group dev <package>`), not with `pip install`, so that `pyproject.toml` and `poetry.lock` stay in sync.
-
-### 5. Provision the AWS infrastructure
-
-Terraform in [infra/](infra/) creates:
-
-| Resource | Name | Notes |
-|---|---|---|
-| S3 bucket | `emaps-etl-<account_id>-<region>` | Data lake (`bronze/`, `silver/`, `gold/`); **publicly readable**, versioned, SSE-S3 encrypted, ACLs disabled, TLS-only, noncurrent versions expire after 30 days |
-| IAM role | `emaps-etl-writer` | Read/write on the whole bucket, read the API key parameter. Can only be assumed by the IAM principals in `writer_principal_arns` (default: the identity that runs Terraform) |
-
-Requirement: an AWS CLI profile with admin rights in the target account.
-
-Store the Electricity Maps API key as an SSM `SecureString` parameter. This is a one-time manual step: the parameter is deliberately not managed by Terraform, because the `aws_ssm_parameter` resource stores the decrypted value in the Terraform state. Terraform only grants the writer role access to it.
-
-```bash
-aws ssm put-parameter --profile <profile> --region eu-central-1 \
-  --name /emaps-etl/electricitymaps/api-key \
-  --type SecureString --overwrite --value "<api-key>"
-```
-
-Apply:
-
-```bash
-cd infra
-cp terraform.tfvars.example terraform.tfvars   # set aws_profile (and optionally writer_principal_arns)
-terraform init
-terraform plan -out tfplan
-terraform apply tfplan
-```
-
-The pipeline writes as the writer role. Add a profile that assumes it to `~/.aws/config` (`terraform output aws_config_profile` prints it); `source_profile` is the profile whose user is allowed to assume the role:
-
-```ini
-[profile emaps-writer]
-role_arn = arn:aws:iam::<account_id>:role/emaps-etl-writer
-source_profile = <profile>
-region = eu-central-1
-```
-
-Profile sections other than `[default]` must be written as `[profile <name>]`; delta-rs ignores sections without the `profile` prefix. Check the role:
-
-```bash
-aws sts get-caller-identity --profile emaps-writer   # ...:assumed-role/emaps-etl-writer/...
-```
-
-### 6. Read the data (no AWS account needed)
-
-The bucket is publicly readable, so anyone can browse and read the data without credentials:
-
-```bash
-aws s3 ls s3://emaps-etl-<account_id>-eu-central-1/ --recursive --no-sign-request
-```
-
-## Running the pipeline
-
-### Configuration
-
-Settings are read from environment variables or a `.env` file (see [.env.example](.env.example)):
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `EMAPS_API_KEY` | (empty) | Electricity Maps API key. When empty, it is read from SSM (`/emaps-etl/electricitymaps/api-key`) |
-| `EMAPS_STORAGE_URI` | `data` | Local folder or S3 location, e.g. `s3://emaps-etl-<account_id>-eu-central-1` |
-| `EMAPS_ZONE` | `FR` | Electricity Maps zone |
-| `EMAPS_AWS_PROFILE` | (empty) | AWS profile for S3 and SSM, e.g. `emaps-writer`. When empty, the standard AWS credential chain is used |
-
-```bash
-cp .env.example .env    # and set EMAPS_API_KEY
-```
-
-### With Dagster (recommended)
-
-```bash
-export DAGSTER_HOME=$PWD/.dagster && mkdir -p $DAGSTER_HOME   # keeps run history between sessions
-poetry run dagster dev -m emaps_etl.definitions
-```
-
-Open http://localhost:3000:
-
-- **Run everything:** *Jobs → etl → Materialize all*.
-- **Schedule:** *Automation → etl_schedule → turn on*. It runs every 12 hours (00:00 and 12:00 UTC) while `dagster dev` is running.
-- **Lineage and checks:** *Assets* shows the Bronze → Silver → Gold graph and the data quality check results.
-
-Or run the job once from the command line:
-
-```bash
-poetry run dagster job execute -m emaps_etl.definitions -j etl
-```
-
-### Without Dagster
-
-```bash
-poetry run python -m emaps_etl
-```
-
-### Writing to S3
-
-The data lives in the S3 bucket. Set the storage location and the writer profile in `.env`; all runs (Dagster and `python -m emaps_etl`) then write to S3 as the writer role:
-
-```bash
-EMAPS_STORAGE_URI=s3://emaps-etl-<account_id>-eu-central-1
-EMAPS_AWS_PROFILE=emaps-writer
-```
-
-Leave `EMAPS_API_KEY` empty to read the API key from SSM. Runs against S3 take about a minute (the Silver and Gold tables span many small daily partitions), compared to a few seconds locally.
-
-To get a local copy of the data, e.g. for the charts (no credentials needed):
-
-```bash
-aws s3 sync s3://emaps-etl-<account_id>-eu-central-1/ sample_data/ --no-sign-request
-```
-
-### Tests and linting
-
-```bash
-poetry run pytest
-poetry run ruff check . && poetry run ruff format --check .
-```
-
-The same checks run in GitHub Actions on every push and pull request ([ci.yml](.github/workflows/ci.yml)).
+Run commands with `poetry run …`, or activate the environment with `source .venv/bin/activate`. In VS Code, select `.venv/bin/python` as the interpreter. Add dependencies with `poetry add <package>` (or `poetry add --group dev <package>`), not with `pip install`, so that `pyproject.toml` and `poetry.lock` stay in sync.
 
 ## Data layers and schemas
 
@@ -289,9 +416,8 @@ Partitioned by **data** time: `year=YYYY/month=MM/day=DD` (string columns `year`
 | `datetime_utc` | timestamp (UTC) | Start of the hour |
 | `source` | string | `nuclear`, `wind`, `solar`, `hydro`, `gas`, `coal`, `oil`, `biomass`, `geothermal`, `unknown`, and storage as `hydro_storage_charge`, `hydro_storage_discharge`, `battery_storage_charge`, `battery_storage_discharge` |
 | `power_mw` | double | Average power in MW; null when the source is not reported |
-| `estimation_method` | string | `MEASURED` or the API's estimation method |
+| `estimation_method` | string | `MEASURED` or the API's estimation method; `SURROGATE` for [surrogate history](#surrogate-history) |
 | `is_estimated` | boolean | True when the value is estimated |
-| `is_surrogate` | boolean | True for generated history, false for real API data |
 | `updated_at` | timestamp (UTC) | When Electricity Maps last updated the value |
 | `ingested_at` | timestamp (UTC) | When the pipeline fetched the value |
 | `year`, `month`, `day` | string | Partition columns |
@@ -307,10 +433,29 @@ The import/export totals in the mix response are left out: `electricity_flows` h
 | `counterpart_zone` | string | Neighbouring zone, e.g. `ES`, `IT-NO` |
 | `import_mw` | double | Power imported from the neighbour (0 when none) |
 | `export_mw` | double | Power exported to the neighbour (0 when none) |
-| `is_surrogate` | boolean | True for generated history, false for real API data |
 | `updated_at` | timestamp (UTC) | When Electricity Maps last updated the value |
 | `ingested_at` | timestamp (UTC) | When the pipeline fetched the value |
 | `year`, `month`, `day` | string | Partition columns |
+
+### Incremental loading
+
+Silver is loaded incrementally from Bronze with a **high-water mark** per table: the `ingested_at` of the last Bronze file loaded into it. It is stored as a small JSON file in the data lake, one per table (the two Silver tables load in parallel):
+
+```
+s3://emaps-etl-<account_id>-eu-central-1/_state/watermark_silver_electricity_mix.json
+{"ingested_at": "2026-10-04T18:48:47.910184+00:00"}
+```
+
+Each run ([silver.load_new_bronze](src/emaps_etl/silver.py)):
+
+1. Reads the watermark. Without a watermark file (first run, or after the [surrogate history](#surrogate-history) rebuild), it is derived from the latest `ingested_at` in the Silver table.
+2. Lists only the Bronze day folders from the watermark's date until today (Bronze is partitioned by ingestion date) and selects the files whose name, which starts with the ingestion timestamp, is newer than the watermark. Only those files are read.
+3. MERGEs them into Silver.
+4. Moves the watermark to the newest loaded file, **only after a successful MERGE**. If that update fails, the next run loads the same files again, which is harmless because the MERGE is idempotent.
+
+So Bronze files are never lost between the layers: when a Silver step fails, the next run catches up with all Bronze files ingested since. In Dagster, the number of loaded files shows as `bronze_files_loaded` in the materialization metadata of the Silver assets. A run without new Bronze files loads nothing and leaves Silver unchanged.
+
+Gold is not incremental: it is rebuilt from Silver on every run (the tables are small). The API side is not incremental either: with the trial API key, every run fetches the last 24 hours (see [Limitations](#no-historical-data-api-trial-access)).
 
 ### Gold: daily data products
 
@@ -323,7 +468,6 @@ Rebuilt from Silver on every run (the tables are small) and partitioned by `year
 | `date_utc` | date | UTC day |
 | `period_start_utc`, `period_end_utc` | timestamp (UTC) | Start and end of the day |
 | `hours_covered` | int | Hours of data in the day |
-| `surrogate_hours` | int | Hours of generated (surrogate) data in the day; 0 means all real |
 | `zone`, `zone_name`, `country_code` | string | Zone metadata, e.g. `FR`, `France`, `FR` |
 | `source` | string | Energy source (storage charging is consumption and is excluded) |
 | `energy_mwh` | double | Energy produced by the source that day |
@@ -337,7 +481,6 @@ Rebuilt from Silver on every run (the tables are small) and partitioned by `year
 | `date_utc` | date | UTC day |
 | `period_start_utc`, `period_end_utc` | timestamp (UTC) | Start and end of the day |
 | `hours_covered` | int | Hours of data in the day |
-| `surrogate_hours` | int | Hours of generated (surrogate) data in the day; 0 means all real |
 | `from_zone`, `from_zone_name`, `from_country_code` | string | Exporting zone (the neighbour for imports, `FR` for exports) |
 | `to_zone`, `to_zone_name`, `to_country_code` | string | Importing zone (`FR` for imports, the neighbour for exports) |
 | `net_mwh` | double | Net energy from `from_zone` to `to_zone` (always > 0) |
@@ -356,35 +499,34 @@ Rebuilt from Silver on every run (the tables are small) and partitioned by `year
 
 API calls are retried with exponential backoff (up to 5 attempts) on rate limiting (429), server errors (5xx), timeouts and connection errors. Other errors, such as an invalid key (401), fail immediately.
 
-### Sample outputs
+### Sample output
 
-`sample_data/` holds 5 years of data: surrogate history from 4 October 2021 up to the most recent real API call, followed by the real data of that call. At about 80 MB it is not committed to git. Generate it with:
+[sample_output/](sample_output/) in the repository is an excerpt of the data lake (about 400 KB), with the same partitioned layout:
 
-```bash
-EMAPS_STORAGE_URI=sample_data poetry run python -m emaps_etl     # real data: the last 24 hours
-poetry run python scripts/generate_surrogate_history.py          # surrogate history + rebuild
+| Layer | Contents |
+|---|---|
+| `bronze/` | All real API responses (JSON), partitioned by ingestion date |
+| `silver/` | Delta tables with all real hours (3 October 2026 15:00 UTC onwards), partitioned by data date |
+| `gold/` | Delta tables from 1 September 2026: [surrogate history](#surrogate-history) until 3 October 2026, real data after. The surrogate days are included so that `fr_daily_imports` has rows: in the real data, France is a net exporter to every neighbour |
+| `_state/` | The high-water marks of the Silver tables |
+
+It was copied from the data lake on 4 October 2026 and is not updated by the pipeline. Browse it with `poetry run python scripts/browse.py sample_output`.
+
+### Data lake layout
+
+The data lake (`s3://emaps-etl-<account_id>-eu-central-1`, publicly readable) holds 5 years of data: [surrogate history](#surrogate-history) from 4 October 2021 up to 3 October 2026 15:00 UTC, followed by the real data collected since. The full data lake is about 55 MB and not committed to git; [sample_output/](sample_output/) is an excerpt, and [3. Deployer](#3-deployer) describes how to build it.
+
 ```
-
-Layout:
-
-```
-sample_data/
-├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>.json                (real)
-├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>_surrogate_<day>.json (surrogate, 1 per day)
+s3://emaps-etl-<account_id>-eu-central-1/
+├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>.json                  (real, 1 per API call)
+├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>_surrogate_<YYYYMM>.json (surrogate, 1 per month)
 ├── bronze/electricity_flows/...                                                        (same)
 ├── silver/electricity_mix/year=YYYY/month=MM/day=DD/part-*.parquet    (+ _delta_log/)
 ├── silver/electricity_flows/year=YYYY/month=MM/day=DD/part-*.parquet  (+ _delta_log/)
 ├── gold/daily_relative_mix/year=YYYY/part-*.parquet                   (+ _delta_log/)
 ├── gold/fr_daily_imports/year=YYYY/part-*.parquet                     (+ _delta_log/)
-└── gold/fr_daily_exports/year=YYYY/part-*.parquet                     (+ _delta_log/)
-```
-
-Read them with Polars:
-
-```python
-import polars as pl
-
-pl.read_delta("sample_data/gold/daily_relative_mix")
+├── gold/fr_daily_exports/year=YYYY/part-*.parquet                     (+ _delta_log/)
+└── _state/watermark_silver_<table>.json                              (high-water marks, see Incremental loading)
 ```
 
 ### Charts
@@ -392,7 +534,7 @@ pl.read_delta("sample_data/gold/daily_relative_mix")
 Generated from the Gold tables with [scripts/plot_gold.py](scripts/plot_gold.py) (matplotlib, a dev dependency). Daily values are aggregated to full calendar months. Most of the data is [surrogate history](#surrogate-history), for demonstration only.
 
 ```bash
-poetry run python scripts/plot_gold.py    # reads sample_data/, writes docs/*.png
+poetry run python scripts/plot_gold.py    # reads the S3 data lake, writes docs/*.png
 ```
 
 **Production mix (`daily_relative_mix`):** the share of each energy source in the monthly production.
@@ -429,11 +571,11 @@ trend (linear from the 2021 level to today's level) × seasonality × daily cycl
 - **Flows:** net export per neighbour with a trend, seasonality (fewer exports in winter) and a random deviation per day, so some days are net imports.
 - **Reproducible:** fixed random seed; standard library only, no extra dependencies.
 
-The surrogate data goes through the normal pipeline: the script writes Bronze files in the API's JSON format and rebuilds Silver and Gold from Bronze. It is always recognisable:
+The surrogate data goes through the normal pipeline: the script writes Bronze files in the API's JSON format to the S3 data lake (one file per stream and month), deletes the Silver and Gold tables and the watermarks, and rebuilds the tables from all Bronze data (the watermarks are re-derived on the next run). It runs as the writer role and takes about 10 minutes, mostly for writing and reading the thousands of small daily partitions of Silver on S3. It arrives in the standard columns; no extra columns are added. It can be recognised by:
 
 - **Bronze:** `source_url` starts with `surrogate://`, and the file name contains `_surrogate_`.
-- **Silver:** `is_surrogate = true`, `estimation_method = "SURROGATE"`.
-- **Gold:** `surrogate_hours` per day (0 means the day is fully real).
+- **Silver:** `estimation_method = "SURROGATE"` in `electricity_mix` (`electricity_flows` has no such column).
+- **Time:** all data before **3 October 2026 15:00 UTC** is surrogate; real API data starts there. In Gold, every day before 3 October 2026 is fully surrogate, 3 October is mixed (15 surrogate hours, 9 real), and later days are real.
 
 Real hours from earlier API calls are replaced by surrogate data (the most recent ingestion wins), so the dataset has a clean split: surrogate before the most recent real API call, real from then on. This also removes the gap of 4 hours (3 October 2026, 11:00–14:00 UTC) between the first two real runs. Surrogate data is for demonstration only and must not be used for analysis.
 

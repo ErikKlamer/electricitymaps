@@ -2,39 +2,41 @@
 
 import dagster as dg
 
-from emaps_etl import bronze, checks, gold, silver, storage
+from emaps_etl import bronze, checks, gold, reader, silver, writer
 from emaps_etl.config import get_settings
 
 
 def _read(layer: str, table: str):
     settings = get_settings()
-    return storage.read_table(storage.path(settings, layer, table), settings)
+    return reader.read_table(writer.path(settings, layer, table), settings.aws_region)
 
 
 # --- Bronze: raw API responses ---
 
 
 @dg.asset(group_name="bronze")
-def bronze_electricity_mix() -> dict:
-    return bronze.ingest("electricity_mix", get_settings())
+def bronze_electricity_mix() -> None:
+    bronze.ingest("electricity_mix", get_settings())
 
 
 @dg.asset(group_name="bronze")
-def bronze_electricity_flows() -> dict:
-    return bronze.ingest("electricity_flows", get_settings())
+def bronze_electricity_flows() -> None:
+    bronze.ingest("electricity_flows", get_settings())
 
 
-# --- Silver: clean Delta tables ---
+# --- Silver: clean Delta tables, loaded incrementally from Bronze (high-water mark) ---
 
 
-@dg.asset(group_name="silver")
-def silver_electricity_mix(bronze_electricity_mix: dict) -> None:
-    silver.update_mix([bronze_electricity_mix], get_settings())
+@dg.asset(group_name="silver", deps=[bronze_electricity_mix])
+def silver_electricity_mix() -> dg.MaterializeResult:
+    files = silver.load_new_bronze(silver.MIX_TABLE, get_settings())
+    return dg.MaterializeResult(metadata={"bronze_files_loaded": files})
 
 
-@dg.asset(group_name="silver")
-def silver_electricity_flows(bronze_electricity_flows: dict) -> None:
-    silver.update_flows([bronze_electricity_flows], get_settings())
+@dg.asset(group_name="silver", deps=[bronze_electricity_flows])
+def silver_electricity_flows() -> dg.MaterializeResult:
+    files = silver.load_new_bronze(silver.FLOWS_TABLE, get_settings())
+    return dg.MaterializeResult(metadata={"bronze_files_loaded": files})
 
 
 # --- Gold: data products ---

@@ -13,7 +13,7 @@ import logging
 import polars as pl
 from deltalake import DeltaTable
 
-from emaps_etl import storage
+from emaps_etl import reader, writer
 from emaps_etl.config import Settings
 
 log = logging.getLogger(__name__)
@@ -57,7 +57,6 @@ def daily_relative_mix(mix: pl.DataFrame, zones: pl.DataFrame) -> pl.DataFrame:
     daily = production.group_by("zone", "date_utc", "source").agg(
         energy_mwh=pl.col("power_mw").sum(),
         hours_covered=pl.col("datetime_utc").n_unique(),
-        surrogate_hours=pl.col("is_surrogate").sum().cast(pl.Int32),
     )
     total = pl.col("energy_mwh").sum().over("zone", "date_utc")
     daily = daily.with_columns(
@@ -71,7 +70,6 @@ def daily_relative_mix(mix: pl.DataFrame, zones: pl.DataFrame) -> pl.DataFrame:
             "period_start_utc",
             "period_end_utc",
             "hours_covered",
-            "surrogate_hours",
             "zone",
             "zone_name",
             "country_code",
@@ -93,7 +91,6 @@ def daily_net_flows(flows: pl.DataFrame) -> pl.DataFrame:
             import_mwh=pl.col("import_mw").sum(),
             export_mwh=pl.col("export_mw").sum(),
             hours_covered=pl.col("datetime_utc").n_unique(),
-            surrogate_hours=pl.col("is_surrogate").sum().cast(pl.Int32),
         )
         .with_columns(net_import_mwh=pl.col("import_mwh") - pl.col("export_mwh"))
     )
@@ -105,7 +102,6 @@ def _flow_table(net_flows: pl.DataFrame, zones: pl.DataFrame, direction: str) ->
         df = net_flows.filter(pl.col("net_import_mwh") > 0).select(
             "date_utc",
             "hours_covered",
-            "surrogate_hours",
             from_zone=pl.col("counterpart_zone"),
             to_zone=pl.col("zone"),
             net_mwh=pl.col("net_import_mwh"),
@@ -114,7 +110,6 @@ def _flow_table(net_flows: pl.DataFrame, zones: pl.DataFrame, direction: str) ->
         df = net_flows.filter(pl.col("net_import_mwh") < 0).select(
             "date_utc",
             "hours_covered",
-            "surrogate_hours",
             from_zone=pl.col("zone"),
             to_zone=pl.col("counterpart_zone"),
             net_mwh=-pl.col("net_import_mwh"),
@@ -130,7 +125,6 @@ def _flow_table(net_flows: pl.DataFrame, zones: pl.DataFrame, direction: str) ->
             "period_start_utc",
             "period_end_utc",
             "hours_covered",
-            "surrogate_hours",
             "from_zone",
             "from_zone_name",
             "from_country_code",
@@ -156,9 +150,9 @@ def daily_exports(flows: pl.DataFrame, zones: pl.DataFrame) -> pl.DataFrame:
 
 def write(df: pl.DataFrame, table: str, constraints: dict[str, str], settings: Settings) -> None:
     """Overwrite the Gold table; constraints are added when the table is created."""
-    uri = storage.path(settings, "gold", table)
-    options = storage.delta_options(settings)
-    is_new = not storage.table_exists(uri, settings)
+    uri = writer.path(settings, "gold", table)
+    options = writer.delta_options(settings)
+    is_new = not writer.table_exists(uri, settings)
 
     df.write_delta(
         uri,
@@ -172,7 +166,7 @@ def write(df: pl.DataFrame, table: str, constraints: dict[str, str], settings: S
 
 
 def build_daily_relative_mix(settings: Settings) -> None:
-    mix = storage.read_table(storage.path(settings, "silver", "electricity_mix"), settings)
+    mix = reader.read_table(writer.path(settings, "silver", "electricity_mix"), settings.aws_region)
     write(
         daily_relative_mix(mix, load_zones(settings)),
         DAILY_MIX_TABLE,
@@ -182,7 +176,9 @@ def build_daily_relative_mix(settings: Settings) -> None:
 
 
 def build_daily_imports(settings: Settings) -> None:
-    flows = storage.read_table(storage.path(settings, "silver", "electricity_flows"), settings)
+    flows = reader.read_table(
+        writer.path(settings, "silver", "electricity_flows"), settings.aws_region
+    )
     write(
         daily_imports(flows, load_zones(settings)),
         IMPORTS_TABLE,
@@ -192,7 +188,9 @@ def build_daily_imports(settings: Settings) -> None:
 
 
 def build_daily_exports(settings: Settings) -> None:
-    flows = storage.read_table(storage.path(settings, "silver", "electricity_flows"), settings)
+    flows = reader.read_table(
+        writer.path(settings, "silver", "electricity_flows"), settings.aws_region
+    )
     write(
         daily_exports(flows, load_zones(settings)),
         EXPORTS_TABLE,
