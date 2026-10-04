@@ -623,6 +623,20 @@ Schemas and data quality rules are enforced by the Delta tables themselves, inst
 - **Cross-row checks** that constraints cannot express (unique keys, daily percentages summing to 100%, missing hours) run as Dagster asset checks.
 - **Fewer dependencies:** no Pandera or PyYAML.
 
+### Incremental Silver load with a high-water mark in the bucket
+
+Silver loads only the Bronze files ingested since the last successful load, tracked by a high-water mark per table (see [Incremental loading](#incremental-loading)).
+
+- **Why a high-water mark:** Silver reads its input from Bronze in the data lake instead of receiving it directly from the Bronze step of the same run. When a Silver step fails, the next run catches up with all Bronze files since the last successful load, and Silver can also be run on its own.
+- **Stored as a small JSON file in the bucket** (`_state/watermark_silver_<table>.json`):
+  - the state lives next to the data it describes;
+  - the writer role can already write there, so no extra infrastructure or permissions are needed.
+- **Not in SSM Parameter Store:** SSM is meant for configuration, not for state that changes on every run, and it would need an extra `ssm:PutParameter` permission and a Terraform change.
+- **Not derived from Silver on every run:** reading `max(ingested_at)` scans the `ingested_at` column across all daily partitions of the Silver table on S3, which is slow. It is only used as a fallback when the watermark file is missing.
+- **One file per table:** the two Silver tables load in parallel; separate files avoid one run overwriting the other's watermark.
+- **Safe order:** the watermark moves only after a successful MERGE; if that update fails, the files are loaded again, which is harmless because the MERGE is idempotent.
+- **Trade-off:** the watermark files are publicly readable like the rest of the bucket. They only contain a timestamp.
+
 ### All timestamps and days in UTC
 
 All timestamps, partitions (`year=YYYY/month=MM/day=DD`) and daily aggregations use **UTC**, the time zone the Electricity Maps API returns.
