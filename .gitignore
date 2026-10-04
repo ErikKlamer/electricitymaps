@@ -5,10 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Pipeline output (local runs) and Dagster state
-data/
+# Dagster state
 .dagster/
 .tmp_dagster_home*/
 
-# Local copy of the full data lake (not committed)
-sample_data/

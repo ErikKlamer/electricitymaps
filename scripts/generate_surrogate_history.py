@@ -1,7 +1,7 @@
-"""Generate 5 years of surrogate (fake) history and rebuild Silver and Gold.
+"""Generate surrogate (fake) history for the current year and rebuild Silver and Gold.
 
 The API key only gives access to the last 24 hours, so history cannot be loaded. This script
-fills everything before the most recent real API call with generated data:
+fills the current year, from 1 January up to the most recent real API call, with generated data:
 
     trend (2021 -> 2026 level) x seasonality x daily cycle (solar) x random noise
 
@@ -26,7 +26,7 @@ from pathlib import Path
 from emaps_etl import bronze, gold, silver, writer
 from emaps_etl.config import get_settings
 
-YEARS = 5
+TREND_YEARS = 5  # the levels below describe a 5-year trend; only the current year is generated
 SEED = 42
 STREAMS = ["electricity_mix", "electricity_flows"]
 
@@ -128,7 +128,9 @@ def flows_entry(ts: datetime, progress: float, day_shift: dict) -> tuple[dict, d
     return imports, exports
 
 
-def surrogate_records(start: datetime, end: datetime, now: datetime) -> list[tuple[str, dict]]:
+def surrogate_records(
+    start: datetime, end: datetime, trend_start: datetime, now: datetime
+) -> list[tuple[str, dict]]:
     """One Bronze record per stream and month, for all hours in [start, end).
 
     Monthly files keep the number of S3 uploads small (about 120 instead of one per day).
@@ -142,7 +144,7 @@ def surrogate_records(start: datetime, end: datetime, now: datetime) -> list[tup
             zone: random.gauss(0, 0.8 * abs(today)) for zone, today in NET_EXPORT_TODAY.items()
         }
         for ts in hours:
-            progress = (ts - start) / (end - start)
+            progress = (ts - trend_start) / (end - trend_start)
             stamp = ts.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             mix = mix_entry(ts, progress)
             imports, exports = flows_entry(ts, progress, day_shift)
@@ -213,11 +215,12 @@ def main() -> None:
         sys.exit(f"No real Bronze data in {root}; run the pipeline first.")
     latest = max(real["electricity_mix"], key=lambda record: record["ingested_at"])
     end = datetime.fromisoformat(latest["response"]["history"][0]["datetime"])
-    start = (end - timedelta(days=365 * YEARS)).replace(hour=0)
+    start = datetime(end.year, 1, 1, tzinfo=UTC)  # current year only
+    trend_start = end - timedelta(days=365 * TREND_YEARS)
 
     surrogate = {stream: [] for stream in STREAMS}
     folder = (f"year={now:%Y}", f"month={now:%m}", f"day={now:%d}")
-    for stream, record in surrogate_records(start, end, now):
+    for stream, record in surrogate_records(start, end, trend_start, now):
         month = record["source_url"].rsplit("/", 1)[1].replace("-", "")
         name = f"{now.strftime(bronze.FILE_TIMESTAMP)}_surrogate_{month}.json"
         writer.write_json(writer.path(settings, "bronze", stream, *folder, name), record)

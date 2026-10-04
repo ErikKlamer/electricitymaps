@@ -11,6 +11,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import polars as pl  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
@@ -61,6 +62,9 @@ def style(ax: plt.Axes) -> None:
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(BASELINE)
     ax.tick_params(colors=MUTED, labelsize=9, length=0)
+    locator = mdates.AutoDateLocator(maxticks=6)  # short date labels that do not overlap
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
 
 def read_gold(root: str, table: str) -> pl.DataFrame:

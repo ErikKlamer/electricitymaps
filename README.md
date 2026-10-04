@@ -32,9 +32,8 @@ Gold     daily data products (Delta tables)              partitioned by year
 | [zones.json](zones.json) | Zone metadata (name, country), a snapshot of the API's `/v4/zones` |
 | [scripts/browse.py](scripts/browse.py) | Browse the Silver and Gold tables interactively |
 | [scripts/plot_gold.py](scripts/plot_gold.py), [docs/](docs/) | Charts of the Gold tables (see [Charts](#charts)) |
-| [scripts/generate_surrogate_history.py](scripts/generate_surrogate_history.py) | Generates 5 years of surrogate history (see [Surrogate history](#surrogate-history)) |
-| [sample_output/](sample_output/) | Sample output: partitioned Bronze files and Silver/Gold Delta tables (see [Sample output](#sample-output)) |
-| `data/` | The data lake (not committed; see [Data lake layout](#data-lake-layout)) |
+| [scripts/generate_surrogate_history.py](scripts/generate_surrogate_history.py) | Generates surrogate history for the current year (see [Surrogate history](#surrogate-history)) |
+| [data/](data/) | The data lake, committed as the sample output: partitioned Bronze files and Silver/Gold Delta tables for the current year (see [Data lake layout](#data-lake-layout)) |
 | [docs/build_pseudocode.md](docs/build_pseudocode.md) | Build order in pseudocode |
 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | CI: lint and tests |
 
@@ -46,7 +45,7 @@ Pick the role that matches your goal:
 |---|---|---|
 | [1. Data consumer](#1-data-consumer) | Browse and analyse the data | No |
 | [2. Data engineer](#2-data-engineer) | Run and maintain the pipeline | Yes |
-| [3. New setup](#3-new-setup) | Set up everything from scratch, including 5 years of history | Yes |
+| [3. New setup](#3-new-setup) | Set up everything from scratch, including the history of the current year | Yes |
 
 Everything runs locally; no cloud account is needed. The tools are installed the same way for all roles: see [Install tools](#install-tools).
 
@@ -71,8 +70,7 @@ Everything runs locally; no cloud account is needed. The tools are installed the
 2. **Browse the tables** with [scripts/browse.py](scripts/browse.py). It asks for a layer (Silver or Gold) and a table, and shows its columns, row count, time range and latest rows:
 
    ```bash
-   poetry run python scripts/browse.py sample_output   # the sample in the repository
-   poetry run python scripts/browse.py                 # the full data lake (data/), once it is built
+   poetry run python scripts/browse.py    # the data lake in the repository (data/)
    ```
 
 3. **Understand the data:** see [Data layers and schemas](#data-layers-and-schemas) for every table and column, and the [charts](#charts) for an overview. Keep in mind:
@@ -85,7 +83,7 @@ Everything runs locally; no cloud account is needed. The tools are installed the
    ```python
    import polars as pl
 
-   pl.read_delta("sample_output/gold/daily_relative_mix")
+   pl.read_delta("data/gold/daily_relative_mix")
    ```
 
 ## 2. Data engineer
@@ -221,7 +219,7 @@ or `Ctrl+C` in the terminal when started in the foreground. The schedule stays t
 
 ## 3. New setup
 
-**Goal:** set up the complete pipeline from scratch: an empty data lake, 5 years of history and the scheduled pipeline.
+**Goal:** set up the complete pipeline from scratch: an empty data lake (`EMAPS_DATA_DIR`), the history of the current year and the scheduled pipeline.
 
 ### Prerequisites
 
@@ -238,7 +236,7 @@ or `Ctrl+C` in the terminal when started in the foreground. The schedule stays t
    poetry run python -m emaps_etl
    ```
 
-3. **Optional: add 5 years of [surrogate history](#surrogate-history)**, so the data products show multi-year trends. It writes surrogate Bronze files, then rebuilds Silver and Gold from all Bronze data:
+3. **Optional: add [surrogate history](#surrogate-history) from 1 January of the current year**, so the data products show trends. It writes surrogate Bronze files, then rebuilds Silver and Gold from all Bronze data:
 
    ```bash
    poetry run python scripts/generate_surrogate_history.py
@@ -404,27 +402,16 @@ Rebuilt from Silver on every run (the tables are small) and partitioned by `year
 
 API calls are retried with exponential backoff (up to 5 attempts) on rate limiting (429), server errors (5xx), timeouts and connection errors. Other errors, such as an invalid key (401), fail immediately.
 
-### Sample output
-
-[sample_output/](sample_output/) in the repository is an excerpt of the data lake (about 400 KB), with the same partitioned layout:
-
-| Layer | Contents |
-|---|---|
-| `bronze/` | All real API responses (JSON), partitioned by ingestion date |
-| `silver/` | Delta tables with all real hours (3 October 2026 15:00 UTC onwards), partitioned by data date |
-| `gold/` | Delta tables from 1 September 2026: [surrogate history](#surrogate-history) until 3 October 2026, real data after. The surrogate days are included so that `fr_daily_imports` has rows: in the real data, France is a net exporter to every neighbour |
-| `_state/` | The high-water marks of the Silver tables |
-
-It was copied from the data lake on 4 October 2026 and is not updated by the pipeline. Browse it with `poetry run python scripts/browse.py sample_output`.
-
 ### Data lake layout
 
-The data lake (`data/`, or `EMAPS_DATA_DIR`) holds 5 years of data: [surrogate history](#surrogate-history) from 4 October 2021 up to 3 October 2026 15:00 UTC, followed by the real data collected since. It is about 110 MB and not committed to git; [sample_output/](sample_output/) is an excerpt, and [3. New setup](#3-new-setup) describes how to build it.
+The data lake ([data/](data/), or `EMAPS_DATA_DIR`) holds the current year: [surrogate history](#surrogate-history) from 1 January 2026 up to 3 October 2026 15:00 UTC, followed by the real data collected since. It is committed to git (about 13 MB) and serves as the sample output of this project, so all tools work right after cloning. [3. New setup](#3-new-setup) describes how to build it from scratch.
+
+Every pipeline run adds Bronze files and new Silver and Gold versions to `data/`, so after a run `git status` shows changes there; they end up in git only when committed.
 
 ```
 data/
 ├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>.json                  (real, 1 per API call)
-├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>_surrogate_<YYYYMM>.json (surrogate, 1 per month)
+├── bronze/electricity_mix/year=YYYY/month=MM/day=DD/<ingested_at>_surrogate_<period>.json (surrogate)
 ├── bronze/electricity_flows/...                                                        (same)
 ├── silver/electricity_mix/year=YYYY/month=MM/day=DD/part-*.parquet    (+ _delta_log/)
 ├── silver/electricity_flows/year=YYYY/month=MM/day=DD/part-*.parquet  (+ _delta_log/)
@@ -461,17 +448,17 @@ The assignment does not specify the time window or the granularity of the analys
 
 Because of the API limitations (see [Limitations](#no-historical-data-api-trial-access)), the multi-year history cannot be loaded: the pipeline can only collect data from the moment it starts running. This repository is therefore an elementary setup to start with. The history builds up as the pipeline keeps running, and with an API key that includes historical access, past years could be backfilled.
 
-To demonstrate the multi-year design, the sample data contains [surrogate history](#surrogate-history).
+To demonstrate the design, the data lake contains [surrogate history](#surrogate-history) for the current year; older years are left out to keep the repository small.
 
 ### Surrogate history
 
-Because historical data cannot be loaded, [scripts/generate_surrogate_history.py](scripts/generate_surrogate_history.py) generates 5 years of hourly surrogate (fake) data for everything before the most recent real API call. Each value is:
+Because historical data cannot be loaded, [scripts/generate_surrogate_history.py](scripts/generate_surrogate_history.py) generates hourly surrogate (fake) data for the current year, from 1 January up to the most recent real API call. Each value is:
 
 ```
 trend (linear from the 2021 level to today's level) × seasonality × daily cycle (solar only) × random noise
 ```
 
-- **Trend:** the energy transition: solar and wind grow, gas, coal and oil decline, nuclear decreases slightly. Today's levels are based on the real API data.
+- **Trend:** the energy transition: solar and wind grow, gas, coal and oil decline, nuclear decreases slightly. The trend is defined over 5 years (2021 → today), so the current year sits at the end of it; today's levels are based on the real API data.
 - **Seasonality:** wind, nuclear and gas higher in winter, hydro peaks in spring, solar higher in summer and zero at night.
 - **Flows:** net export per neighbour with a trend, seasonality (fewer exports in winter) and a random deviation per day, so some days are net imports.
 - **Reproducible:** fixed random seed; standard library only, no extra dependencies.
@@ -510,7 +497,7 @@ The data lake is a local folder (`data/`) instead of cloud storage such as S3.
 - **Anyone can run it end to end** with only an Electricity Maps API key: no cloud account, infrastructure, credentials or roles.
 - **Simple and fast:** a full run takes about 30 seconds; on S3 the many small daily partitions made runs several times slower.
 - **API key in `.env`:** gitignored, so it never ends up in the repository.
-- **Trade-off:** the data lives on one machine and is not shared; [sample_output/](sample_output/) in the repository serves as the shared sample. Moving to cloud storage later is contained: all file access goes through [writer.py](src/emaps_etl/writer.py) and [reader.py](src/emaps_etl/reader.py), and delta-rs supports S3, Azure and GCS natively.
+- **Trade-off:** the data is not shared live; the current year is committed in [data/](data/) as the shared sample. Moving to cloud storage later is contained: all file access goes through [writer.py](src/emaps_etl/writer.py) and [reader.py](src/emaps_etl/reader.py), and delta-rs supports S3, Azure and GCS natively.
 
 ### Data contracts as Delta table constraints
 
