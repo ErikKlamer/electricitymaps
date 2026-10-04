@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars and adjust.
+aws_profile = "t-pragma"
+aws_region  = "eu-central-1"
+
+# IAM users/roles allowed to assume the writer role. Leave out to allow only the identity that
+# runs Terraform.
+# writer_principal_arns = ["arn:aws:iam::<account_id>:user/<name>"]

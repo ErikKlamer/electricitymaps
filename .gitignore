@@ -1,0 +1,23 @@
+.venv/
+.env
+# Terraform
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+infra/tfplan
+crash.log
+infra/terraform.tfvars
+
+# Python
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Pipeline output (local runs) and Dagster state
+data/
+.dagster/
+.tmp_dagster_home*/
+
+# Sample output with generated history (~80 MB); regenerate with scripts/generate_surrogate_history.py
+sample_data/
