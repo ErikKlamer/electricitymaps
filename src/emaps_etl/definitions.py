@@ -8,7 +8,7 @@ from emaps_etl.config import get_settings
 
 def _read(layer: str, table: str):
     settings = get_settings()
-    return reader.read_table(writer.path(settings, layer, table), settings.aws_region)
+    return reader.read_table(writer.path(settings, layer, table))
 
 
 # --- Bronze: raw API responses ---

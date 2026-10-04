@@ -20,14 +20,14 @@ def read(table: str, settings: Settings) -> datetime | None:
     Without a watermark file (first run, or after a rebuild), it is derived once from the
     latest ingested_at in the Silver table itself.
     """
-    data = reader.read_json(_uri(table, settings), settings.aws_region)
+    data = reader.read_json(_uri(table, settings))
     if data:
         return datetime.fromisoformat(data["ingested_at"])
     uri = writer.path(settings, "silver", table)
-    if writer.table_exists(uri, settings):
-        return reader.read_table(uri, settings.aws_region).get_column("ingested_at").max()
+    if writer.table_exists(uri):
+        return reader.read_table(uri).get_column("ingested_at").max()
     return None
 
 
 def write(table: str, ingested_at: datetime, settings: Settings) -> None:
-    writer.write_json(_uri(table, settings), {"ingested_at": ingested_at.isoformat()}, settings)
+    writer.write_json(_uri(table, settings), {"ingested_at": ingested_at.isoformat()})

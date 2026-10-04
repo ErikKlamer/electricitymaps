@@ -133,22 +133,19 @@ def upsert(
 ) -> None:
     """Create the Delta table on first write, otherwise MERGE on the key."""
     uri = writer.path(settings, "silver", table)
-    options = writer.delta_options(settings)
 
-    if not writer.table_exists(uri, settings):
+    if not writer.table_exists(uri):
         df.write_delta(
             uri,
             mode="error",
-            storage_options=options,
             delta_write_options={"partition_by": PARTITION_COLUMNS, "name": table},
         )
-        DeltaTable(uri, storage_options=options).alter.add_constraint(constraints)
+        DeltaTable(uri).alter.add_constraint(constraints)
     else:
         (
             df.write_delta(
                 uri,
                 mode="merge",
-                storage_options=options,
                 delta_merge_options={
                     "predicate": " AND ".join(f"t.{column} = s.{column}" for column in key),
                     "source_alias": "s",

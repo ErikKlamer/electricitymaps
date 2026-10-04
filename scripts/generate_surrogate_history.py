@@ -10,19 +10,21 @@ starts with "surrogate://", and then processed by the normal pipeline. In Silver
 have estimation_method = "SURROGATE". Real hours before the last API call are replaced by
 surrogate data.
 
-Writes to the S3 data lake (EMAPS_STORAGE_URI) as the writer role (EMAPS_AWS_PROFILE) and
-replaces its Silver and Gold tables:
+Writes to the local data lake (EMAPS_DATA_DIR, default data/) and replaces its Silver and Gold
+tables:
     poetry run python scripts/generate_surrogate_history.py
 """
 
 import json
 import math
 import random
+import shutil
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from emaps_etl import bronze, gold, silver, writer
-from emaps_etl.config import aws_session, get_settings
+from emaps_etl.config import get_settings
 
 YEARS = 5
 SEED = 42
@@ -190,44 +192,25 @@ def surrogate_records(start: datetime, end: datetime, now: datetime) -> list[tup
     ]
 
 
-def list_keys(s3, bucket: str, prefix: str) -> list[str]:
-    pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
-    return [obj["Key"] for page in pages for obj in page.get("Contents", [])]
-
-
-def delete_keys(s3, bucket: str, keys: list[str]) -> None:
-    for i in range(0, len(keys), 1000):  # S3 deletes at most 1000 objects per request
-        objects = [{"Key": key} for key in keys[i : i + 1000]]
-        s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
-
-
-def read_json(s3, bucket: str, key: str) -> dict:
-    return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
-
-
 def main() -> None:
     settings = get_settings()
-    s3 = aws_session(settings).client("s3")
-    bucket, _, root = settings.storage_uri.removeprefix("s3://").partition("/")
-    prefix = f"{root}/" if root else ""
+    root = Path(settings.data_dir)
     random.seed(SEED)
     now = datetime.now(UTC)
 
     # Remove surrogate files from a previous run, so the script can be re-run.
-    bronze_keys = list_keys(s3, bucket, f"{prefix}bronze/")
-    delete_keys(s3, bucket, [key for key in bronze_keys if "_surrogate_" in key])
+    for old in (root / "bronze").rglob("*_surrogate_*.json"):
+        old.unlink()
     real = {
         stream: [
-            read_json(s3, bucket, key)
-            for key in bronze_keys
-            if f"bronze/{stream}/" in key and "_surrogate_" not in key
+            json.loads(f.read_text()) for f in sorted((root / "bronze" / stream).rglob("*.json"))
         ]
         for stream in STREAMS
     }
 
     # Surrogate history ends where the most recent real API call starts.
     if not real["electricity_mix"]:
-        sys.exit(f"No real Bronze data in {settings.storage_uri}; run the pipeline first.")
+        sys.exit(f"No real Bronze data in {root}; run the pipeline first.")
     latest = max(real["electricity_mix"], key=lambda record: record["ingested_at"])
     end = datetime.fromisoformat(latest["response"]["history"][0]["datetime"])
     start = (end - timedelta(days=365 * YEARS)).replace(hour=0)
@@ -237,21 +220,20 @@ def main() -> None:
     for stream, record in surrogate_records(start, end, now):
         month = record["source_url"].rsplit("/", 1)[1].replace("-", "")
         name = f"{now.strftime(bronze.FILE_TIMESTAMP)}_surrogate_{month}.json"
-        writer.write_json(writer.path(settings, "bronze", stream, *folder, name), record, settings)
+        writer.write_json(writer.path(settings, "bronze", stream, *folder, name), record)
         surrogate[stream].append(record)
     print(f"Wrote surrogate Bronze data from {start} to {end}")
 
     # Rebuild Silver and Gold from all Bronze records. The most recently ingested value per hour
     # wins, so surrogate data replaces older real hours, and the latest real call stays real.
-    delete_keys(s3, bucket, list_keys(s3, bucket, f"{prefix}silver/"))
-    delete_keys(s3, bucket, list_keys(s3, bucket, f"{prefix}gold/"))
-    delete_keys(s3, bucket, list_keys(s3, bucket, f"{prefix}_state/"))  # watermarks: re-derived
+    for layer in ("silver", "gold", "_state"):  # watermarks in _state are re-derived
+        shutil.rmtree(root / layer, ignore_errors=True)
     silver.update_mix(real["electricity_mix"] + surrogate["electricity_mix"], settings)
     silver.update_flows(real["electricity_flows"] + surrogate["electricity_flows"], settings)
     gold.build_daily_relative_mix(settings)
     gold.build_daily_imports(settings)
     gold.build_daily_exports(settings)
-    print(f"Rebuilt Silver and Gold in {settings.storage_uri}")
+    print(f"Rebuilt Silver and Gold in {root}")
 
 
 if __name__ == "__main__":

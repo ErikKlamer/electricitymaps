@@ -151,22 +151,20 @@ def daily_exports(flows: pl.DataFrame, zones: pl.DataFrame) -> pl.DataFrame:
 def write(df: pl.DataFrame, table: str, constraints: dict[str, str], settings: Settings) -> None:
     """Overwrite the Gold table; constraints are added when the table is created."""
     uri = writer.path(settings, "gold", table)
-    options = writer.delta_options(settings)
-    is_new = not writer.table_exists(uri, settings)
+    is_new = not writer.table_exists(uri)
 
     df.write_delta(
         uri,
         mode="overwrite",
-        storage_options=options,
         delta_write_options={"partition_by": ["year"], "name": table},
     )
     if is_new:
-        DeltaTable(uri, storage_options=options).alter.add_constraint(constraints)
+        DeltaTable(uri).alter.add_constraint(constraints)
     log.info("Wrote %d rows to gold/%s", len(df), table)
 
 
 def build_daily_relative_mix(settings: Settings) -> None:
-    mix = reader.read_table(writer.path(settings, "silver", "electricity_mix"), settings.aws_region)
+    mix = reader.read_table(writer.path(settings, "silver", "electricity_mix"))
     write(
         daily_relative_mix(mix, load_zones(settings)),
         DAILY_MIX_TABLE,
@@ -176,9 +174,7 @@ def build_daily_relative_mix(settings: Settings) -> None:
 
 
 def build_daily_imports(settings: Settings) -> None:
-    flows = reader.read_table(
-        writer.path(settings, "silver", "electricity_flows"), settings.aws_region
-    )
+    flows = reader.read_table(writer.path(settings, "silver", "electricity_flows"))
     write(
         daily_imports(flows, load_zones(settings)),
         IMPORTS_TABLE,
@@ -188,9 +184,7 @@ def build_daily_imports(settings: Settings) -> None:
 
 
 def build_daily_exports(settings: Settings) -> None:
-    flows = reader.read_table(
-        writer.path(settings, "silver", "electricity_flows"), settings.aws_region
-    )
+    flows = reader.read_table(writer.path(settings, "silver", "electricity_flows"))
     write(
         daily_exports(flows, load_zones(settings)),
         EXPORTS_TABLE,

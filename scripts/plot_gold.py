@@ -1,6 +1,6 @@
 """Plot the Gold time series as PNG charts for the README.
 
-    poetry run python scripts/plot_gold.py [location]   # default: the S3 data lake -> docs/*.png
+    poetry run python scripts/plot_gold.py [location]   # default: data/ -> docs/*.png
 
 Daily values are aggregated to full calendar months; 5 years of daily data is too noisy to read.
 """
@@ -206,7 +206,7 @@ def save(fig: plt.Figure, name: str) -> Path:
 
 
 def main() -> None:
-    root = sys.argv[1] if len(sys.argv) > 1 else get_settings().storage_uri
+    root = sys.argv[1] if len(sys.argv) > 1 else str(get_settings().data_dir)
     for path in (plot_mix_share(root), plot_net_exports(root)):
         print(f"Wrote {path}")
 

@@ -18,25 +18,18 @@ def load_record(stream: str) -> dict:
 
 
 @pytest.fixture
-def settings(tmp_path, monkeypatch) -> Settings:
-    """Settings whose writes go to a temporary local folder instead of S3."""
-    monkeypatch.setattr(writer, "path", lambda _, *parts: "/".join([str(tmp_path), *parts]))
-    monkeypatch.setattr(writer, "delta_options", lambda _: {})
-
-    def write_json(uri: str, data: dict, _) -> None:
-        Path(uri).parent.mkdir(parents=True, exist_ok=True)
-        Path(uri).write_text(json.dumps(data))
-
-    monkeypatch.setattr(writer, "write_json", write_json)
-    return Settings(storage_uri="s3://test-bucket", api_key="test-key")
+def settings(tmp_path) -> Settings:
+    return Settings(data_dir=tmp_path, api_key="test-key")
 
 
 # --- Settings ---
 
 
-def test_storage_must_be_s3():
-    with pytest.raises(ValueError, match="must be an S3 location"):
-        Settings(storage_uri="data", api_key="test-key")
+def test_api_key_is_required_to_fetch(tmp_path):
+    from emaps_etl.config import get_api_key
+
+    with pytest.raises(ValueError, match="EMAPS_API_KEY is not set"):
+        get_api_key(Settings(data_dir=tmp_path, api_key=None))
 
 
 # --- Silver ---
@@ -78,7 +71,7 @@ def test_silver_upsert_is_idempotent_and_updates_values(settings):
     silver.update_mix([record], settings)
 
     uri = writer.path(settings, "silver", silver.MIX_TABLE)
-    first = reader.read_table(uri, settings.aws_region)
+    first = reader.read_table(uri)
     assert len(first) == len(silver.flatten_mix(record))
 
     # A newer ingestion of the same hour overwrites the value instead of adding a row.
@@ -87,7 +80,7 @@ def test_silver_upsert_is_idempotent_and_updates_values(settings):
     newer["response"]["history"][0]["mix"]["nuclear"] = 12345.0
     silver.update_mix([newer], settings)
 
-    updated = reader.read_table(uri, settings.aws_region)
+    updated = reader.read_table(uri)
     assert len(updated) == len(first)
     hour = datetime.fromisoformat(record["response"]["history"][0]["datetime"])
     nuclear = updated.filter(pl.col("datetime_utc") == hour, pl.col("source") == "nuclear")
@@ -108,7 +101,7 @@ def write_bronze(record: dict, stream: str, settings: Settings) -> None:
     ingested_at = datetime.fromisoformat(record["ingested_at"])
     folder = f"year={ingested_at:%Y}/month={ingested_at:%m}/day={ingested_at:%d}"
     name = f"{ingested_at.strftime(bronze.FILE_TIMESTAMP)}.json"
-    writer.write_json(writer.path(settings, "bronze", stream, folder, name), record, settings)
+    writer.write_json(writer.path(settings, "bronze", stream, folder, name), record)
 
 
 def test_incremental_load_only_loads_new_bronze_files(settings):
@@ -125,7 +118,7 @@ def test_incremental_load_only_loads_new_bronze_files(settings):
 
     assert silver.load_new_bronze(silver.MIX_TABLE, settings) == 1  # only the new file
     assert watermark.read(silver.MIX_TABLE, settings) == datetime(2026, 10, 3, 21, 30, tzinfo=UTC)
-    df = reader.read_table(writer.path(settings, "silver", silver.MIX_TABLE), settings.aws_region)
+    df = reader.read_table(writer.path(settings, "silver", silver.MIX_TABLE))
     assert 12345.0 in df["power_mw"].to_list()
 
 
@@ -197,12 +190,10 @@ def test_full_pipeline_from_fixtures(settings):
     gold.build_daily_imports(settings)
     gold.build_daily_exports(settings)
 
-    daily_mix = reader.read_table(
-        writer.path(settings, "gold", gold.DAILY_MIX_TABLE), settings.aws_region
-    )
+    daily_mix = reader.read_table(writer.path(settings, "gold", gold.DAILY_MIX_TABLE))
     assert checks.percentages_sum_to_100(daily_mix)[0]
     for table in (gold.IMPORTS_TABLE, gold.EXPORTS_TABLE):
-        df = reader.read_table(writer.path(settings, "gold", table), settings.aws_region)
+        df = reader.read_table(writer.path(settings, "gold", table))
         assert (df["net_mwh"] > 0).all()
 
 

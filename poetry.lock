@@ -129,46 +129,6 @@ files = [
 ]
 
 [[package]]
-name = "boto3"
-version = "1.43.107"
-description = "The AWS SDK for Python (Boto3)"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "boto3-1.43.107-py3-none-any.whl", hash = "sha256:632a4f8298725b94144c8cd383cbdacb34624daa73221e954c3d33ac6e2528d6"},
-    {file = "boto3-1.43.107.tar.gz", hash = "sha256:c4e0f1a0295cbb7103f2950128cf88463c076d220080a7d0f127cf834969fc3a"},
-]
-
-[package.dependencies]
-botocore = ">=1.43.107,<1.44.0"
-jmespath = ">=0.7.1,<2.0.0"
-s3transfer = ">=0.19.0,<0.20.0"
-
-[package.extras]
-crt = ["botocore[crt] (>=1.21.0,<2.0a0)"]
-
-[[package]]
-name = "botocore"
-version = "1.43.107"
-description = "Low-level, data-driven core of boto 3."
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "botocore-1.43.107-py3-none-any.whl", hash = "sha256:23cbe854e815dbaccf097f7fd32b461c9e1d2ed7e0c7dcc5658218704509d840"},
-    {file = "botocore-1.43.107.tar.gz", hash = "sha256:4a37fa072a00280c746313532d19b00e2dc53f1993222601df104d71d548d5b6"},
-]
-
-[package.dependencies]
-jmespath = ">=0.7.1,<2.0.0"
-python-dateutil = ">=2.1,<3.0.0"
-urllib3 = ">=1.25.4,!=2.2.0,<3"
-
-[package.extras]
-crt = ["awscrt (==0.36.0)"]
-
-[[package]]
 name = "certifi"
 version = "2026.7.22"
 description = "Python package for providing Mozilla's CA Bundle."
@@ -1134,18 +1094,6 @@ MarkupSafe = ">=2.0"
 
 [package.extras]
 i18n = ["Babel (>=2.7)"]
-
-[[package]]
-name = "jmespath"
-version = "1.1.0"
-description = "JSON Matching Expressions"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "jmespath-1.1.0-py3-none-any.whl", hash = "sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64"},
-    {file = "jmespath-1.1.0.tar.gz", hash = "sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d"},
-]
 
 [[package]]
 name = "kiwisolver"
@@ -2697,24 +2645,6 @@ files = [
 ]
 
 [[package]]
-name = "s3transfer"
-version = "0.19.2"
-description = "An Amazon S3 Transfer Manager"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "s3transfer-0.19.2-py3-none-any.whl", hash = "sha256:d8168eccca828cbb2cd573675333f3bddd254313a9c42494b84c76b539e8ba25"},
-    {file = "s3transfer-0.19.2.tar.gz", hash = "sha256:ba0309fd86be3c27dbf78cdd813c13c5e1df16e5874b99d2535ebbdfb9892993"},
-]
-
-[package.dependencies]
-botocore = ">=1.37.4,<2.0a0"
-
-[package.extras]
-crt = ["botocore[crt] (>=1.37.4,<2.0a0)"]
-
-[[package]]
 name = "six"
 version = "1.17.0"
 description = "Python 2 and 3 compatibility utilities"
@@ -3701,4 +3631,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.13"
-content-hash = "0dc98c3d711751e30d540d2b9ec58f36ee81dbc40147f53afbfb45b7caaa6027"
+content-hash = "a2f964ae63bf6e91b8353589958788ca863e1fc60d228d534c0b490389ac0859"

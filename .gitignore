@@ -1,14 +1,5 @@
 .venv/
 .env
-# Terraform
-infra/.terraform/
-*.tfstate
-*.tfstate.*
-*.tfplan
-infra/tfplan
-crash.log
-infra/terraform.tfvars
-
 # Python
 __pycache__/
 .pytest_cache/
@@ -19,5 +10,5 @@ data/
 .dagster/
 .tmp_dagster_home*/
 
-# Sample output with generated history (~80 MB); regenerate with scripts/generate_surrogate_history.py
+# Local copy of the full data lake (not committed)
 sample_data/

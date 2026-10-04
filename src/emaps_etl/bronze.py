@@ -51,7 +51,7 @@ def ingest(stream: str, settings: Settings) -> dict:
         f"day={ingested_at:%d}",
         f"{ingested_at.strftime(FILE_TIMESTAMP)}.json",
     )
-    writer.write_json(file_path, record, settings)
+    writer.write_json(file_path, record)
     log.info("Stored %s (%d hours) in %s", stream, len(response.get("history", [])), file_path)
     return record
 
@@ -70,10 +70,10 @@ def records_since(stream: str, after: datetime | None, settings: Settings) -> li
         dates = [after.date() + timedelta(days=n) for n in range(days + 1)]
         folders = [f"{root}/year={d:%Y}/month={d:%m}/day={d:%d}" for d in dates]
 
-    uris = [uri for folder in folders for uri in reader.list_files(folder, settings.aws_region)]
+    uris = [uri for folder in folders for uri in reader.list_files(folder)]
     if after is not None:
         uris = [uri for uri in uris if ingested_at_of(uri) > after]
-    return [reader.read_json(uri, settings.aws_region) for uri in uris]
+    return [reader.read_json(uri) for uri in uris]
 
 
 def ingested_at_of(uri: str) -> datetime:

@@ -1,16 +1,12 @@
 """Browse the Silver and Gold Delta tables interactively.
 
-    poetry run python scripts/browse.py s3://<bucket>    # the S3 data lake, no credentials needed
-    poetry run python scripts/browse.py sample_data      # a local copy
-    poetry run python scripts/browse.py                  # EMAPS_STORAGE_URI from .env
-
-Reads from S3 without credentials (the bucket is publicly readable), or from a local copy.
+poetry run python scripts/browse.py                  # the data lake (EMAPS_DATA_DIR, default data/)
+poetry run python scripts/browse.py sample_output    # the sample in the repository
 """
 
 import sys
 
 import polars as pl
-from pydantic import ValidationError
 
 from emaps_etl import gold, reader, silver
 from emaps_etl.config import get_settings
@@ -51,13 +47,7 @@ def show(df: pl.DataFrame, layer: str, table: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        storage = sys.argv[1]
-    else:
-        try:
-            storage = get_settings().storage_uri
-        except ValidationError:
-            sys.exit("Usage: browse.py <location>, e.g. s3://<bucket> or sample_data")
+    storage = sys.argv[1] if len(sys.argv) > 1 else str(get_settings().data_dir)
     pl.Config.set_tbl_rows(20)
     pl.Config.set_tbl_cols(-1)
     pl.Config.set_tbl_width_chars(200)
